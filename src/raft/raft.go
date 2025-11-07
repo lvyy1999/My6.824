@@ -38,9 +38,8 @@ const (
 // the constant about time
 const (
 	HeartbeatInterval    = 100 // the interval of leader to send heartbeat, unit : milliseconds
-	MinElectionTimeout   = 200 // the minimum of election timeout, unit : milliseconds
-	SpanElectionTimeout  = 200 // the span of election timeout, unit : milliseconds
-	CheckTimeoutInterval = 5   // the interval of follower to check if timeout, unit : milliseconds
+	MinElectionTimeout   = 250 // the minimum of election timeout, unit : milliseconds
+	CheckTimeoutInterval = 10  // the interval of follower to check if timeout, unit : milliseconds
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -82,11 +81,10 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	role              int // the role of this peer in raft
-	applyCh           chan ApplyMsg
-	logCount          int   // the count of log entries (not include the initial one virtual log, so the last log is log[logCount])
-	electionTimeout   int64 // the random election timeout, reset it in rf.resetElectionTimeout
-	lastHeartbeatTime int64 // the time of last received heartbeat, update it in rf.resetElectionTimeout
+	role             int // the role of this peer in raft
+	applyCh          chan ApplyMsg
+	logCount         int   // the count of log entries (not include the initial one virtual log, so the last log is log[logCount])
+	nextElectionTime int64 // the time of next election, reset it in rf.resetElectionTimeout
 
 	// Persistent state on all servers (Updated on stable storage before responding to RPCs):
 	log         []Log // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
@@ -103,8 +101,16 @@ type Raft struct {
 
 }
 
+func (rf *Raft) setRole(role int) {
+	if rf.role != role {
+		//fmt.Println(time.Now().UnixMilli(), "server ", rf.me, " become from role ", rf.role, " to role ", role,
+		//	", term = ", rf.currentTerm)
+		rf.role = role
+	}
+}
+
 // If RPC request or response contains term T > currentTerm:
-// set currentTerm = T, convert to follower, and reset voteFor
+// set currentTerm = T, convert to follower, and reset voteFor.
 // Call this function when receive a request or response firstly.
 func (rf *Raft) checkAndUpdateCurrentTerm(term int) {
 	rf.mu.Lock()
@@ -112,19 +118,21 @@ func (rf *Raft) checkAndUpdateCurrentTerm(term int) {
 	if term > rf.currentTerm {
 		rf.votedFor = -1
 		rf.currentTerm = term
-		rf.role = RaftRoleFollower
+		rf.resetElectionTimeout()
+		rf.setRole(RaftRoleFollower)
 	}
 }
 
 // will br called in three cases : receive leader's heartbeat; begin an election; vote for a candidate
-// reset the electionTimeout and update the lastHeartbeatTime
+// reset the nextElectionTime to the time of now + a random value between MinElectionTimeout and 2 * MinElectionTimeout
 func (rf *Raft) resetElectionTimeout() {
-	atomic.StoreInt64(&rf.lastHeartbeatTime, time.Now().UnixMilli())
-	atomic.StoreInt64(&rf.electionTimeout, int64(MinElectionTimeout+rand.Intn(SpanElectionTimeout)))
+	timeout := int64(MinElectionTimeout + rand.Intn(MinElectionTimeout))
+	atomic.StoreInt64(&rf.nextElectionTime, time.Now().UnixMilli()+timeout)
 }
 
 func (rf *Raft) checkElectionTimeout() bool {
-	return time.Now().UnixMilli()-atomic.LoadInt64(&rf.electionTimeout) > atomic.LoadInt64(&rf.lastHeartbeatTime)
+	nextElectionTime := atomic.LoadInt64(&rf.nextElectionTime)
+	return time.Now().After(time.UnixMilli(nextElectionTime))
 }
 
 // return currentTerm and whether this server
@@ -211,7 +219,15 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.checkAndUpdateCurrentTerm(args.Term)
+
+	//fmt.Println(time.Now().UnixMilli(), "server ", rf.me, " receive RequestVote from candidate ", args.CandidateId,
+	//	", args.Term = ", args.Term,
+	//	", rf.currentTerm = ", rf.currentTerm,
+	//	", rf.votedFor = ", rf.votedFor)
+
+	if args.Term > rf.currentTerm {
+		rf.checkAndUpdateCurrentTerm(args.Term)
+	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -226,6 +242,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// Then if candidate’s log is at least as up-to-date as receiver’s log, grant vote
 		reply.VoteGranted = true
 		rf.resetElectionTimeout()
+		rf.setRole(RaftRoleFollower)
 		rf.votedFor = args.CandidateId
 	}
 
@@ -261,9 +278,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if ok {
-		rf.checkAndUpdateCurrentTerm(reply.Term)
-	}
 	return ok
 }
 
@@ -282,14 +296,12 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.checkAndUpdateCurrentTerm(args.Term)
+	if args.Term > rf.currentTerm {
+		rf.checkAndUpdateCurrentTerm(args.Term)
+	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	//fmt.Println("server ", rf.me, " receive heartbeat from leader ", args.LeaderId,
-	//	", args.Term = ", args.Term,
-	//	", rf.currentTerm = ", rf.currentTerm)
 
 	if args.Term < rf.currentTerm {
 		// Reply false if term < currentTerm
@@ -297,16 +309,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.Success = true
 		rf.resetElectionTimeout()
+		rf.setRole(RaftRoleFollower)
 	}
+
+	//fmt.Println(time.Now().UnixMilli(), "server ", rf.me, " receive AppendEntries from leader ", args.LeaderId,
+	//	", args.Term = ", args.Term,
+	//	", rf.currentTerm = ", rf.currentTerm,
+	//	", rf.votedFor = ", rf.votedFor)
 
 	reply.Term = rf.currentTerm
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok {
-		rf.checkAndUpdateCurrentTerm(reply.Term)
-	}
 	return ok
 }
 
@@ -353,6 +368,7 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) sendHeartbeat() {
 	rf.mu.Lock()
+	role := rf.role
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		Entries:      make([]Log, 0),
@@ -361,16 +377,21 @@ func (rf *Raft) sendHeartbeat() {
 	}
 	rf.mu.Unlock()
 
+	if role != RaftRoleLeader {
+		return
+	}
+
+	//fmt.Println(time.Now().UnixMilli(), "leader ", rf.me, " begin to send heartbeat",
+	//	", term = ", args.Term)
+
 	// Send heartbeat to all other servers asynchronously
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			reply := AppendEntriesReply{}
 			go func(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 				ok := rf.sendAppendEntries(server, args, reply)
-				if ok && !reply.Success {
-					rf.mu.Lock()
-					rf.role = RaftRoleFollower
-					rf.mu.Unlock()
+				if ok && reply.Term > rf.currentTerm {
+					rf.checkAndUpdateCurrentTerm(reply.Term)
 				}
 			}(i, &args, &reply)
 		}
@@ -381,11 +402,17 @@ func (rf *Raft) sendHeartbeat() {
 // It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers in the cluster.
 // Return true only if this candidate wins the election.
 func (rf *Raft) beginAnElection() {
+	if !rf.checkElectionTimeout() {
+		return
+	}
+
+	//fmt.Println(time.Now().UnixMilli(), "server ", rf.me, " begin an election")
+
 	rf.mu.Lock()
 	rf.currentTerm++
-	rf.role = RaftRoleCandidate
 	rf.votedFor = rf.me
 	rf.resetElectionTimeout()
+	rf.setRole(RaftRoleCandidate)
 	half := int32(len(rf.peers) / 2) // need at least (half + 1) votes to win the election
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -402,6 +429,9 @@ func (rf *Raft) beginAnElection() {
 			reply := RequestVoteReply{}
 			go func(server int, args *RequestVoteArgs, reply *RequestVoteReply, votedCount, unvotedCount *int32) {
 				ok := rf.sendRequestVote(server, args, reply)
+				if ok && reply.Term > rf.currentTerm {
+					rf.checkAndUpdateCurrentTerm(reply.Term)
+				}
 				if ok && reply.VoteGranted {
 					atomic.AddInt32(votedCount, 1)
 				} else {
@@ -411,23 +441,28 @@ func (rf *Raft) beginAnElection() {
 		}
 	}
 
-	// if received votes is not enough, to spin wait
-	for atomic.LoadInt32(&votedCount) <= half && atomic.LoadInt32(&unvotedCount) <= half {
-		time.Sleep(1 * time.Millisecond)
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// may receive heartbeat from a new leader during waiting for voting, so need to check state
-	if rf.currentTerm == args.Term && rf.role == RaftRoleCandidate {
-		// check the result of election and transit role
-		if atomic.LoadInt32(&votedCount) > half {
-			rf.role = RaftRoleLeader
-		} else {
-			rf.role = RaftRoleFollower
+	// Collect the votes asynchronously
+	go func(votedCount, unvotedCount *int32) {
+		// if received votes is not enough, to spin wait
+		for atomic.LoadInt32(votedCount) <= half && atomic.LoadInt32(unvotedCount) <= half {
+			time.Sleep(time.Millisecond * time.Duration(10))
 		}
-		rf.votedFor = -1
-	}
+
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// may receive heartbeat from a new leader during waiting for voting, so need to check state
+		if rf.currentTerm == args.Term && rf.role == RaftRoleCandidate {
+			// check the result of election and transit role
+			if atomic.LoadInt32(votedCount) > half {
+				rf.setRole(RaftRoleLeader)
+				//fmt.Println("candidate ", rf.me, " wins the election", ", term = ", rf.currentTerm)
+			} else {
+				//rf.votedFor = -1
+				rf.setRole(RaftRoleFollower)
+				//fmt.Println("candidate ", rf.me, " fails the election", ", term = ", rf.currentTerm)
+			}
+		}
+	}(&votedCount, &unvotedCount)
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -437,10 +472,7 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		rf.mu.Lock()
-		role := rf.role
-		rf.mu.Unlock()
-		if role == RaftRoleLeader {
+		if rf.role == RaftRoleLeader {
 			// send heartbeat
 			rf.sendHeartbeat()
 			// according to lab requirement, sleep for 100 ms to send heartbeat again
