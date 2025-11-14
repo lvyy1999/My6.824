@@ -18,13 +18,13 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
-	//	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -118,6 +118,7 @@ func (rf *Raft) checkAndUpdateCurrentTerm(term int) {
 		rf.currentTerm = term
 		rf.resetElectionTimeout()
 		rf.setRole(RaftRoleFollower)
+		rf.persist()
 	}
 }
 
@@ -136,7 +137,7 @@ func (rf *Raft) resetElectionTimeout() {
 
 func (rf *Raft) checkElectionTimeout() bool {
 	nextElectionTime := atomic.LoadInt64(&rf.nextElectionTime)
-	return time.Now().After(time.UnixMilli(nextElectionTime))
+	return time.Now().UnixMilli() >= nextElectionTime
 }
 
 // return currentTerm and whether this server
@@ -145,6 +146,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term = rf.currentTerm
 	isleader = rf.role == RaftRoleLeader
 	return term, isleader
@@ -156,12 +159,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -171,17 +175,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var log []Log
+	var votedFor int
+	var currentTerm int
+	if d.Decode(&log) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&currentTerm) != nil {
+		DWriteErrorLog("read persist fail")
+	} else {
+		rf.log = log
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -223,13 +230,13 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	DWriteDebugLog("server", rf.me, "receive RequestVote from candidate", args.CandidateId,
 		", args.Term = ", args.Term,
 		", rf.votedFor = ", rf.votedFor,
 		", rf.currentTerm = ", rf.currentTerm)
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	if args.Term > rf.currentTerm {
 		rf.checkAndUpdateCurrentTerm(args.Term)
@@ -248,6 +255,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.resetElectionTimeout()
 		rf.setRole(RaftRoleFollower)
 		rf.votedFor = args.CandidateId
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
@@ -344,6 +352,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// Append any new entries not already in the log.
 			rf.log = rf.log[:args.PrevLogIndex+1]
 			rf.log = append(rf.log, args.Entries...)
+			rf.persist()
 
 			// If leaderCommit > commitIndex, set commitIndex =
 			// min(leaderCommit, index of last new entry)
@@ -410,6 +419,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Index:   index,
 			Command: command,
 		})
+		rf.persist()
 
 		DWriteInfoLog("leader", rf.me, "received a command", command,
 			", term =", term,
@@ -461,6 +471,7 @@ func (rf *Raft) sendHeartbeat() {
 				PrevLogIndex: prevLog.Index,
 				LeaderCommit: rf.commitIndex,
 			}
+
 			go func(server int, args *AppendEntriesArgs) {
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(server, args, &reply)
@@ -563,12 +574,18 @@ func (rf *Raft) checkAndReplicateLog() {
 // It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers in the cluster.
 // Return true only if this candidate wins the election.
 func (rf *Raft) beginAnElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != RaftRoleFollower {
+		return
+	}
+
 	DWriteInfoLog("server", rf.me, "begin an election")
 
 	// Update rf's state
-	rf.mu.Lock()
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.resetElectionTimeout()
 	rf.setRole(RaftRoleCandidate)
 	half := int32(len(rf.peers) / 2) // need at least (half + 1) votes to win the election
@@ -579,7 +596,6 @@ func (rf *Raft) beginAnElection() {
 		LastLogTerm:  lastLog.Term,
 		LastLogIndex: lastLog.Index,
 	}
-	rf.mu.Unlock()
 
 	// Send RequestVote RPCs to all other servers asynchronously and collect the votes
 	var votedCount, unvotedCount int32 = 1, 0
@@ -625,6 +641,7 @@ func (rf *Raft) beginAnElection() {
 			} else {
 				rf.setRole(RaftRoleFollower)
 				//rf.votedFor = -1
+				//rf.persist()
 			}
 		}
 	}(&votedCount, &unvotedCount)
@@ -637,13 +654,17 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		if rf.role == RaftRoleLeader {
+		rf.mu.Lock()
+		role := rf.role
+		rf.mu.Unlock()
+		if role == RaftRoleLeader {
 			// send heartbeat
 			if rf.needToSendHeartbeat() {
 				rf.sendHeartbeat()
 			} else { // avoid to send heartbeat and log replication at the same time, reduce rpc callings
 				rf.checkAndReplicateLog()
 			}
+			// sleep for a little time to check again
 			time.Sleep(time.Millisecond * time.Duration(CheckLogInterval))
 		} else {
 			// if election timeout, to begin an election
@@ -661,7 +682,7 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applier() {
 	for rf.killed() == false {
 		rf.mu.Lock()
-		if rf.commitIndex > rf.lastApplied {
+		if rf.commitIndex > rf.lastApplied && rf.lastApplied+1 < len(rf.log) {
 			rf.lastApplied++
 			applyLog := rf.log[rf.lastApplied]
 			DWriteInfoLog("server", rf.me, "applies a log",
