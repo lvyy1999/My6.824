@@ -40,7 +40,8 @@ const (
 	HeartbeatInterval      = 100 // the interval of leader to send heartbeat
 	MinElectionTimeout     = 250 // the minimum of election timeout
 	CheckApplyInterval     = 20  // the interval of all server to check whether exist new log to apply
-	CheckElectionInterval  = 10  // the interval of follower to check whether it need to begin new election
+	CheckElectionInterval  = 20  // the interval of follower to check whether it need to begin new election
+	CheckVoteCountInterval = 20  // the interval of candidate to check whether received enough vote
 	CheckReplicateInterval = 25  // the interval of leader to check whether exist new log to replicate
 )
 
@@ -138,20 +139,18 @@ func (rf *Raft) checkAndUpdateCurrentTerm(term int) {
 }
 
 func (rf *Raft) needToSendHeartbeat() bool {
-	lastSendHeartBeat := atomic.LoadInt64(&rf.lastSendHeartBeat)
-	return time.Now().UnixMilli()-lastSendHeartBeat >= int64(HeartbeatInterval)
+	return time.Now().UnixMilli()-rf.lastSendHeartBeat >= int64(HeartbeatInterval)
 }
 
 // will be called in three cases : receive leader's heartbeat; begin an election; vote for a candidate
 // reset the nextElectionTime to the time of now + a random value between MinElectionTimeout and 2 * MinElectionTimeout
 func (rf *Raft) resetElectionTimeout() {
 	timeout := int64(MinElectionTimeout + rand.Intn(MinElectionTimeout))
-	atomic.StoreInt64(&rf.nextElectionTime, time.Now().UnixMilli()+timeout)
+	rf.nextElectionTime = time.Now().UnixMilli() + timeout
 }
 
 func (rf *Raft) checkElectionTimeout() bool {
-	nextElectionTime := atomic.LoadInt64(&rf.nextElectionTime)
-	return time.Now().UnixMilli() >= nextElectionTime
+	return time.Now().UnixMilli() >= rf.nextElectionTime
 }
 
 // return currentTerm and whether this server
@@ -407,6 +406,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.checkAndUpdateCurrentTerm(args.Term)
 	}
 
+	reply.Term = rf.currentTerm
+
 	lastLog := rf.getLastLog()
 	if args.Term < rf.currentTerm {
 		// Reply false if term < currentTerm
@@ -422,8 +423,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		rf.persist()
 	}
-
-	reply.Term = rf.currentTerm
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -649,15 +648,13 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) sendHeartbeat() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if rf.role != RaftRoleLeader {
 		return
 	}
 
 	DWriteDebugLog("leader", rf.me, "begin to send heartbeat, term =", rf.currentTerm)
 
-	atomic.StoreInt64(&rf.lastSendHeartBeat, time.Now().UnixMilli()) // update heartbeat time
+	rf.lastSendHeartBeat = time.Now().UnixMilli() // update heartbeat time
 
 	// Send heartbeat to all other servers asynchronously
 	for i := 0; i < len(rf.peers); i++ {
@@ -713,8 +710,6 @@ func (rf *Raft) checkAndCommitLog() {
 }
 
 func (rf *Raft) checkAndReplicateLog() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if rf.role != RaftRoleLeader {
 		return
 	}
@@ -739,8 +734,6 @@ func (rf *Raft) checkAndReplicateLog() {
 // It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers in the cluster.
 // Return true only if this candidate wins the election.
 func (rf *Raft) beginAnElection() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if rf.role != RaftRoleFollower {
 		return
 	}
@@ -787,7 +780,7 @@ func (rf *Raft) beginAnElection() {
 	go func(votedCount, unvotedCount *int32) {
 		// if received votes is not enough, to spin wait
 		for atomic.LoadInt32(votedCount) <= half && atomic.LoadInt32(unvotedCount) <= half {
-			time.Sleep(time.Millisecond * time.Duration(10))
+			time.Sleep(time.Millisecond * time.Duration(CheckVoteCountInterval))
 		}
 
 		rf.mu.Lock()
@@ -798,7 +791,6 @@ func (rf *Raft) beginAnElection() {
 			if atomic.LoadInt32(votedCount) > half {
 				DWriteInfoLog("candidate", rf.me, " wins the election, term =", rf.currentTerm)
 				rf.setRole(RaftRoleLeader)
-				// atomic.StoreInt64(&rf.lastSendHeartBeat, 0) // ensure to send heartbeat immediately
 				for i := 0; i < len(rf.peers); i++ {
 					rf.matchIndex[i] = 0
 					rf.nextIndex[i] = args.LastLogIndex + 1
@@ -820,9 +812,7 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		rf.mu.Lock()
-		role := rf.role
-		rf.mu.Unlock()
-		if role == RaftRoleLeader {
+		if rf.role == RaftRoleLeader {
 			if rf.needToSendHeartbeat() {
 				// sendHeartbeat will send RPC even no new logs
 				rf.sendHeartbeat()
@@ -830,6 +820,7 @@ func (rf *Raft) ticker() {
 				// checkAndReplicateLog only send RPC if exist new logs
 				rf.checkAndReplicateLog()
 			}
+			rf.mu.Unlock()
 			// sleep for a little time to check again
 			time.Sleep(time.Millisecond * time.Duration(CheckReplicateInterval))
 		} else {
@@ -837,6 +828,7 @@ func (rf *Raft) ticker() {
 			if rf.checkElectionTimeout() {
 				rf.beginAnElection()
 			}
+			rf.mu.Unlock()
 			// sleep for a little time to check again
 			time.Sleep(time.Millisecond * time.Duration(CheckElectionInterval))
 		}
